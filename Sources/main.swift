@@ -293,6 +293,60 @@ final class WebController: ObservableObject {
     }
 }
 
+// MARK: - Document bridge
+
+/// SwiftUI's `DocumentGroup` is backed by `NSDocument` with autosaving-in-place,
+/// and that has no off switch: any write to `document.text` bumps the change
+/// count, and a changed document gets written back to the file on its own — on a
+/// timer, on app deactivation, on quit. Reaching the `NSDocument` lets a reload
+/// put fresh text on screen without ever arming that write, so a window that is
+/// only being read never touches the file.
+enum DocumentBridge {
+    static func nsDocument(for url: URL?) -> NSDocument? {
+        guard let url else { return nil }
+        if let doc = NSDocumentController.shared.document(for: url) { return doc }
+        // Fall back to a resolved-path match: the URL the scene hands us can be
+        // an alias or go through a symlinked directory.
+        let resolved = url.resolvingSymlinksInPath().standardizedFileURL
+        return NSDocumentController.shared.documents.first {
+            $0.fileURL?.resolvingSymlinksInPath().standardizedFileURL == resolved
+        }
+    }
+
+    /// True when the window holds edits that are not on disk.
+    static func hasUnsavedEdits(_ url: URL?) -> Bool {
+        nsDocument(for: url)?.isDocumentEdited ?? false
+    }
+
+    /// Declares the in-memory document identical to the file on disk: clears the
+    /// edited flag, so autosave has nothing to write, and adopts the file's
+    /// current modification date, so a later save doesn't report that the file
+    /// was changed by another application.
+    static func markClean(_ url: URL?) {
+        guard let doc = nsDocument(for: url) else { return }
+        doc.updateChangeCount(.changeCleared)
+        if let url,
+           let date = try? FileManager.default
+               .attributesOfItem(atPath: url.path)[.modificationDate] as? Date {
+            doc.fileModificationDate = date
+        }
+    }
+}
+
+/// Size + modification date, to spot a write by another application.
+struct FileStamp: Equatable {
+    let modified: Date
+    let size: Int64
+
+    init?(url: URL?) {
+        guard let url,
+              let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let modified = attrs[.modificationDate] as? Date else { return nil }
+        self.modified = modified
+        self.size = (attrs[.size] as? NSNumber)?.int64Value ?? -1
+    }
+}
+
 // MARK: - Content view (sidebar + detail)
 
 struct ContentView: View {
@@ -303,6 +357,8 @@ struct ContentView: View {
     @State private var visibility: NavigationSplitViewVisibility = .automatic
     @State private var copiedRecently: Bool = false
     @State private var refreshSpin: Bool = false
+    @State private var lastSeenOnDisk: FileStamp? = nil
+    @State private var diskPoll = Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()
     @StateObject private var controller = WebController()
     @AppStorage("appTheme") private var theme: AppTheme = .system
 
@@ -320,18 +376,49 @@ struct ContentView: View {
     }
 
     private func refresh() {
-        guard let url = fileURL else { return }
+        guard loadFromDisk(silent: false) else { return }
+        withAnimation(.easeOut(duration: 0.4)) { refreshSpin.toggle() }
+    }
+
+    /// Puts the file's current contents on screen. Writing through the binding
+    /// is what marks the document edited, so the edited flag is cleared right
+    /// after — twice, because SwiftUI can bump the change count on the runloop
+    /// turn after the assignment returns.
+    @discardableResult
+    private func loadFromDisk(silent: Bool) -> Bool {
+        guard let url = fileURL else { return false }
+        let fresh: String
         do {
-            document.text = try String(contentsOf: url, encoding: .utf8)
-            withAnimation(.easeOut(duration: 0.4)) { refreshSpin.toggle() }
+            fresh = try String(contentsOf: url, encoding: .utf8)
         } catch {
-            let alert = NSAlert()
-            alert.messageText = "Couldn't reload file"
-            alert.informativeText = error.localizedDescription
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
+            if !silent {
+                let alert = NSAlert()
+                alert.messageText = "Couldn't reload file"
+                alert.informativeText = error.localizedDescription
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+            }
+            return false
         }
+        lastSeenOnDisk = FileStamp(url: url)
+        if fresh != document.text { document.text = fresh }
+        DocumentBridge.markClean(url)
+        DispatchQueue.main.async { DocumentBridge.markClean(url) }
+        return true
+    }
+
+    /// Picks up writes made by another application while the file is open for
+    /// reading. Skipped while editing, and skipped whenever the window holds
+    /// unsaved edits — those keep macOS's own conflict handling.
+    private func reloadIfChangedOnDisk() {
+        guard !isEditing, let url = fileURL else { return }
+        guard let stamp = FileStamp(url: url), stamp != lastSeenOnDisk else { return }
+        guard !DocumentBridge.hasUnsavedEdits(url) else {
+            lastSeenOnDisk = stamp
+            return
+        }
+        loadFromDisk(silent: true)
     }
 
     var body: some View {
@@ -356,6 +443,15 @@ struct ContentView: View {
         }
         .navigationSplitViewStyle(.balanced)
         .preferredColorScheme(theme.colorScheme)
+        .onAppear {
+            lastSeenOnDisk = FileStamp(url: fileURL)
+            DocumentBridge.markClean(fileURL)
+        }
+        .onReceive(diskPoll) { _ in reloadIfChangedOnDisk() }
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didBecomeActiveNotification)) { _ in
+            reloadIfChangedOnDisk()
+        }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button {
@@ -494,6 +590,22 @@ struct MarkdownWebView: NSViewRepresentable {
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.preferences.javaScriptCanOpenWindowsAutomatically = false
+        // Track the scroll offset so a reload — ⌘R, or another application
+        // writing the file — can put the reader back where they were instead of
+        // at the top of the document.
+        let tracker = WKUserScript(source: """
+        (function() {
+          var last = -1;
+          window.addEventListener('scroll', function() {
+            var y = window.scrollY;
+            if (Math.abs(y - last) < 4) return;
+            last = y;
+            window.webkit.messageHandlers.scrollPos.postMessage(y);
+          }, { passive: true });
+        })();
+        """, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+        config.userContentController.addUserScript(tracker)
+        config.userContentController.add(context.coordinator, name: "scrollPos")
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.setValue(false, forKey: "drawsBackground")
@@ -510,6 +622,9 @@ struct MarkdownWebView: NSViewRepresentable {
             webView.appearance = theme.nsAppearance
         }
         if coord.lastText != text || coord.lastFileURL != fileURL {
+            let sameDocument = coord.lastText != nil && coord.lastFileURL == fileURL
+            coord.restoreY = sameDocument ? coord.lastScrollY : nil
+            coord.lastScrollY = sameDocument ? coord.lastScrollY : 0
             coord.lastText = text
             coord.lastFileURL = fileURL
             coord.loaded = false
@@ -526,7 +641,7 @@ struct MarkdownWebView: NSViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    final class Coordinator: NSObject, WKNavigationDelegate {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         weak var webView: WKWebView?
         var lastText: String?
         var lastFileURL: URL?
@@ -534,10 +649,23 @@ struct MarkdownWebView: NSViewRepresentable {
         var loaded: Bool = false
         var lastScrollID: UUID?
         var pendingSlug: String?
+        var lastScrollY: Double = 0
+        var restoreY: Double?
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             loaded = true
+            if let y = restoreY, y > 0 {
+                webView.evaluateJavaScript("window.scrollTo(0, \(y));")
+            }
+            restoreY = nil
             flushScrollIfReady()
+        }
+
+        func userContentController(_ controller: WKUserContentController,
+                                   didReceive message: WKScriptMessage) {
+            guard message.name == "scrollPos",
+                  let y = message.body as? Double else { return }
+            lastScrollY = y
         }
 
         func flushScrollIfReady() {

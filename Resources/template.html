@@ -1,0 +1,164 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Markdown</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --fg: #1d1d1f;
+  --bg: transparent;
+  --muted: #6e6e73;
+  --border: #d2d2d7;
+  --code-bg: rgba(0,0,0,0.05);
+  --link: #0066cc;
+  --accent: #0071e3;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #f5f5f7;
+    --muted: #98989d;
+    --border: #3a3a3c;
+    --code-bg: rgba(255,255,255,0.08);
+    --link: #5eaeff;
+  }
+}
+html, body { background: var(--bg); }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+  color: var(--fg);
+  line-height: 1.6;
+  font-size: 15px;
+  margin: 0;
+  padding: 32px 44px 80px;
+  max-width: 820px;
+  margin-left: auto;
+  margin-right: auto;
+  -webkit-font-smoothing: antialiased;
+}
+h1, h2, h3, h4, h5, h6 {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
+  font-weight: 600;
+  line-height: 1.25;
+  margin-top: 1.6em;
+  margin-bottom: 0.6em;
+}
+h1 { font-size: 2em; border-bottom: 1px solid var(--border); padding-bottom: 0.3em; margin-top: 0.4em; }
+h2 { font-size: 1.5em; border-bottom: 1px solid var(--border); padding-bottom: 0.25em; }
+h3 { font-size: 1.25em; }
+h4 { font-size: 1.05em; }
+h5, h6 { font-size: 1em; color: var(--muted); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code, pre, kbd, samp {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.9em;
+}
+code { background: var(--code-bg); padding: 0.15em 0.35em; border-radius: 4px; }
+pre {
+  background: var(--code-bg);
+  padding: 14px 16px;
+  border-radius: 8px;
+  overflow-x: auto;
+  line-height: 1.45;
+}
+pre code { background: transparent; padding: 0; border-radius: 0; }
+blockquote {
+  border-left: 3px solid var(--border);
+  color: var(--muted);
+  padding: 0.1em 1em;
+  margin-left: 0;
+}
+hr { border: none; border-top: 1px solid var(--border); margin: 2em 0; }
+table { border-collapse: collapse; width: 100%; }
+th, td { border: 1px solid var(--border); padding: 6px 12px; text-align: left; }
+th { background: var(--code-bg); font-weight: 600; }
+img { max-width: 100%; height: auto; border-radius: 6px; }
+ul, ol { padding-left: 1.6em; }
+li + li { margin-top: 0.25em; }
+li > p { margin-bottom: 0.5em; }
+input[type="checkbox"] { margin-right: 0.4em; }
+/* marked's default task-list output: <li><input type="checkbox" ...>...</li> */
+li:has(> input[type="checkbox"]) { list-style: none; margin-left: -1.4em; }
+</style>
+<script src="marked.min.js"></script>
+</head>
+<body>
+<article id="content"></article>
+<script>
+(function () {
+  const source = /*__MARKDOWN__*/"";
+  const target = document.getElementById('content');
+  function showError(label, err) {
+    const note = document.createElement('pre');
+    note.style.background = 'rgba(255,80,80,0.10)';
+    note.style.color = '#b00020';
+    note.style.padding = '12px 16px';
+    note.style.borderRadius = '8px';
+    note.style.marginBottom = '12px';
+    note.textContent = label + ': ' + (err && err.message ? err.message : String(err));
+    target.appendChild(note);
+    const pre = document.createElement('pre');
+    pre.textContent = source;
+    target.appendChild(pre);
+  }
+  window.addEventListener('error', function (ev) {
+    showError('JS error', ev.error || ev.message);
+  });
+  if (typeof marked === 'undefined') {
+    showError('marked failed to load', 'undefined');
+    return;
+  }
+  function slugify(input) {
+    const lower = String(input).toLowerCase();
+    let buf = '';
+    for (let i = 0; i < lower.length; i++) {
+      const code = lower.charCodeAt(i);
+      const isLower = code >= 0x61 && code <= 0x7A;
+      const isDigit = code >= 0x30 && code <= 0x39;
+      buf += (isLower || isDigit) ? lower[i] : ' ';
+    }
+    return buf.split(/\s+/).filter(Boolean).join('-');
+  }
+  const seenSlugs = {};
+  // Only override the heading renderer (to add slug IDs for the sidebar).
+  // Overriding `listitem` in marked v14 corrupts the parser's renderer chain
+  // ("Token with 'list' type was not found") so we let marked handle list
+  // items itself — gfm: true already emits <input type="checkbox"> for tasks.
+  marked.use({
+    gfm: true,
+    breaks: false,
+    renderer: {
+      heading({ tokens, depth }) {
+        const html = this.parser.parseInline(tokens);
+        const plain = html.replace(/<[^>]+>/g, '');
+        let slug = slugify(plain) || 'section';
+        if (seenSlugs[slug] !== undefined) {
+          seenSlugs[slug] += 1;
+          slug = slug + '-' + seenSlugs[slug];
+        } else {
+          seenSlugs[slug] = 0;
+        }
+        return '<h' + depth + ' id="' + slug + '">' + html + '</h' + depth + '>\n';
+      }
+    }
+  });
+  try {
+    target.innerHTML = marked.parse(source);
+  } catch (e) {
+    showError('marked.parse threw', e);
+  }
+  // Open external links in default browser is handled by the host; relative links still resolve via baseURL.
+  document.querySelectorAll('a[href^="#"]').forEach(a => {
+    a.addEventListener('click', (ev) => {
+      const id = decodeURIComponent(a.getAttribute('href').slice(1));
+      const el = document.getElementById(id) || document.querySelector('[name="' + id + '"]');
+      if (el) { ev.preventDefault(); el.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+    });
+  });
+})();
+</script>
+</body>
+</html>

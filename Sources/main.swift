@@ -56,7 +56,9 @@ struct MarkdownDocument: FileDocument {
 // MARK: - Heading outline
 
 struct Heading: Identifiable, Hashable {
-    let id: UUID = UUID()
+    /// Derived from the slug so a re-parse keeps the sidebar rows. A fresh id
+    /// per parse replaces every row on each body evaluation.
+    var id: String { slug }
     let level: Int
     let text: String
     let slug: String
@@ -210,6 +212,57 @@ enum AppTheme: String, CaseIterable, Identifiable {
 final class WebController: ObservableObject {
     weak var webView: WKWebView?
 
+    /// Find state for the rendered view. The matches live in the page's DOM,
+    /// so counting and stepping go through JavaScript.
+    @Published var findCount: Int = 0
+    @Published var findIndex: Int = -1
+    private(set) var findQuery: String = ""
+
+    func updateFind(_ query: String) {
+        findQuery = query
+        guard !query.isEmpty else { clearFind(); return }
+        guard let wv = webView else { return }
+        // One call, so overlapping searches can't each step past the first match.
+        let js = "window.__find ? __find.search(\(Self.jsString(query))) : [0, -1]"
+        wv.evaluateJavaScript(js) { result, _ in
+            let values = (result as? [NSNumber])?.map(\.intValue) ?? [0, -1]
+            self.findCount = values.first ?? 0
+            self.findIndex = values.last ?? -1
+        }
+    }
+
+    func stepFind(_ delta: Int) {
+        guard let wv = webView, !findQuery.isEmpty else { return }
+        wv.evaluateJavaScript("window.__find ? __find.go(\(delta)) : -1") { result, _ in
+            if let idx = (result as? NSNumber)?.intValue, idx >= 0 { self.findIndex = idx }
+        }
+    }
+
+    /// Drops the highlights but keeps the query, so a reload can restore them.
+    func clearFind() {
+        findCount = 0
+        findIndex = -1
+        webView?.evaluateJavaScript("window.__find && __find.clear();")
+    }
+
+    func endFind() {
+        findQuery = ""
+        clearFind()
+    }
+
+    func reapplyFind() {
+        guard !findQuery.isEmpty else { return }
+        updateFind(findQuery)
+    }
+
+    private static func jsString(_ s: String) -> String {
+        let data = (try? JSONSerialization.data(withJSONObject: [s])) ?? Data()
+        var out = String(data: data, encoding: .utf8) ?? "[\"\"]"
+        if out.hasPrefix("[") { out.removeFirst() }
+        if out.hasSuffix("]") { out.removeLast() }
+        return out
+    }
+
     func copy(_ markdown: String) {
         let pb = NSPasteboard.general
         pb.clearContents()
@@ -360,6 +413,12 @@ struct ContentView: View {
     @State private var lastSeenOnDisk: FileStamp? = nil
     @State private var diskPoll = Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()
     @StateObject private var controller = WebController()
+    @StateObject private var editorController = EditorController()
+    @State private var findVisible: Bool = false
+    @State private var findQuery: String = ""
+    @State private var editorMatches: [NSRange] = []
+    @State private var editorIndex: Int = -1
+    @State private var findFocusRequest: Int = 0
     @AppStorage("appTheme") private var theme: AppTheme = .system
 
     init(document: Binding<MarkdownDocument>, fileURL: URL?) {
@@ -421,23 +480,109 @@ struct ContentView: View {
         loadFromDisk(silent: true)
     }
 
+    // MARK: Find
+
+    private var findMatchCount: Int {
+        isEditing ? editorMatches.count : controller.findCount
+    }
+
+    private var findStatus: String {
+        guard !findQuery.isEmpty else { return "" }
+        guard findMatchCount > 0 else { return "No results" }
+        let index = isEditing ? editorIndex : controller.findIndex
+        return "\(max(0, index) + 1) of \(findMatchCount)"
+    }
+
+    private func openFind() {
+        findVisible = true
+        findFocusRequest += 1
+        if !findQuery.isEmpty { runFind() }
+    }
+
+    private func closeFind() {
+        findVisible = false
+        editorMatches = []
+        editorIndex = -1
+        controller.endFind()
+    }
+
+    /// Recomputes the match set. In the editor the first match at or after the
+    /// caret is selected, so ⌘F picks up from where you are reading.
+    private func runFind() {
+        guard isEditing else {
+            controller.updateFind(findQuery)
+            return
+        }
+        editorMatches = Self.ranges(of: findQuery, in: document.text)
+        guard !editorMatches.isEmpty else { editorIndex = -1; return }
+        let caret = editorController.caretLocation
+        editorIndex = editorMatches.firstIndex { $0.location >= caret } ?? 0
+        editorController.reveal(editorMatches[editorIndex])
+    }
+
+    /// Refreshes the matches after an edit without touching the selection.
+    /// Revealing a match here would make the next keystroke replace it.
+    private func refreshEditorMatches() {
+        editorMatches = Self.ranges(of: findQuery, in: document.text)
+        editorIndex = editorMatches.isEmpty ? -1 : min(max(0, editorIndex), editorMatches.count - 1)
+    }
+
+    private func stepFind(_ delta: Int) {
+        guard isEditing else {
+            controller.stepFind(delta)
+            return
+        }
+        guard !editorMatches.isEmpty else { runFind(); return }
+        let from = editorIndex < 0 ? 0 : editorIndex
+        editorIndex = (from + delta + editorMatches.count) % editorMatches.count
+        editorController.reveal(editorMatches[editorIndex])
+    }
+
+    private static func ranges(of query: String, in text: String) -> [NSRange] {
+        guard !query.isEmpty else { return [] }
+        let haystack = text as NSString
+        var found: [NSRange] = []
+        var start = 0
+        while start < haystack.length {
+            let searchRange = NSRange(location: start, length: haystack.length - start)
+            let match = haystack.range(of: query, options: .caseInsensitive, range: searchRange)
+            if match.location == NSNotFound { break }
+            found.append(match)
+            start = match.location + max(1, match.length)
+        }
+        return found
+    }
+
     var body: some View {
         NavigationSplitView(columnVisibility: $visibility) {
             sidebar
                 .navigationSplitViewColumnWidth(min: 180, ideal: 240, max: 360)
         } detail: {
-            Group {
-                if isEditing {
-                    editor
-                } else {
-                    MarkdownWebView(
-                        text: text,
-                        fileURL: fileURL,
-                        scrollRequest: scrollRequest,
-                        theme: theme,
-                        controller: controller
+            VStack(spacing: 0) {
+                if findVisible {
+                    FindBar(
+                        query: $findQuery,
+                        status: findStatus,
+                        hasMatches: findMatchCount > 0,
+                        focusRequest: findFocusRequest,
+                        onStep: stepFind,
+                        onClose: closeFind
                     )
-                    .ignoresSafeArea(.container, edges: .bottom)
+                    Divider()
+                }
+                Group {
+                    if isEditing {
+                        editor
+                    } else {
+                        MarkdownWebView(
+                            text: text,
+                            fileURL: fileURL,
+                            scrollRequest: scrollRequest,
+                            theme: theme,
+                            controller: controller
+                        )
+                        .ignoresSafeArea(.container, edges: .bottom)
+                    }
                 }
             }
         }
@@ -452,7 +597,32 @@ struct ContentView: View {
             for: NSApplication.didBecomeActiveNotification)) { _ in
             reloadIfChangedOnDisk()
         }
+        .onChange(of: findQuery) { _ in
+            guard findVisible else { return }
+            runFind()
+        }
+        .onChange(of: isEditing) { _ in
+            guard findVisible else { return }
+            controller.clearFind()
+            editorMatches = []
+            editorIndex = -1
+            // The incoming view doesn't exist yet when this runs.
+            DispatchQueue.main.async { runFind() }
+        }
+        .onChange(of: text) { _ in
+            guard findVisible, isEditing else { return }
+            refreshEditorMatches()
+        }
         .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    openFind()
+                } label: {
+                    Image(systemName: "magnifyingglass")
+                }
+                .help("Find (⌘F)")
+                .keyboardShortcut("f", modifiers: .command)
+            }
             ToolbarItem(placement: .primaryAction) {
                 Button {
                     withAnimation(.easeInOut(duration: 0.15)) { isEditing.toggle() }
@@ -515,12 +685,12 @@ struct ContentView: View {
 
     @ViewBuilder private var editor: some View {
         ZStack(alignment: .topLeading) {
-            TextEditor(text: $document.text)
-                .font(.system(.body, design: .monospaced))
-                .lineSpacing(2)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
-                .scrollContentBackground(.hidden)
+            MarkdownTextEditor(
+                text: $document.text,
+                controller: editorController,
+                autoFocus: !findVisible
+            )
+            .padding(.horizontal, 4)
             if document.text.isEmpty {
                 Text("Paste or type Markdown here…\n\nThen ⌘S to save, or hit the eye icon to preview.")
                     .font(.system(.body, design: .monospaced))
@@ -578,6 +748,155 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Find bar
+
+/// Owns the field's `@FocusState` so that only this view depends on focus. On
+/// `ContentView` it re-runs the whole body whenever focus moves.
+struct FindBar: View {
+    @Binding var query: String
+    let status: String
+    let hasMatches: Bool
+    /// Bumped by ⌘F, so pressing it again returns to the field.
+    let focusRequest: Int
+    let onStep: (Int) -> Void
+    let onClose: () -> Void
+    @FocusState private var fieldFocused: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            TextField("Find", text: $query)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .focused($fieldFocused)
+                .onSubmit { onStep(1) }
+                .frame(maxWidth: 260)
+            Text(status)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .frame(minWidth: 72, alignment: .leading)
+            Spacer(minLength: 0)
+            Button { onStep(-1) } label: { Image(systemName: "chevron.up") }
+                .help("Previous match (⇧⌘G)")
+                .keyboardShortcut("g", modifiers: [.command, .shift])
+                .disabled(!hasMatches)
+            Button { onStep(1) } label: { Image(systemName: "chevron.down") }
+                .help("Next match (⌘G)")
+                .keyboardShortcut("g", modifiers: .command)
+                .disabled(!hasMatches)
+            Button("Done", action: onClose)
+                .keyboardShortcut(.cancelAction)
+                .font(.system(size: 12))
+        }
+        .buttonStyle(.borderless)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(.bar)
+        .onAppear { DispatchQueue.main.async { fieldFocused = true } }
+        .onChange(of: focusRequest) { _ in fieldFocused = true }
+    }
+}
+
+// MARK: - Plain-text editor (NSTextView)
+
+/// Holds the editor's `NSTextView` so the find bar can select and reveal a
+/// match. SwiftUI's `TextEditor` exposes neither selection nor scrolling.
+final class EditorController: ObservableObject {
+    weak var textView: NSTextView?
+
+    var caretLocation: Int {
+        textView?.selectedRange().location ?? 0
+    }
+
+    func reveal(_ range: NSRange) {
+        guard let tv = textView else { return }
+        guard NSMaxRange(range) <= (tv.string as NSString).length else { return }
+        tv.setSelectedRange(range)
+        tv.scrollRangeToVisible(range)
+        tv.showFindIndicator(for: range)
+    }
+}
+
+struct MarkdownTextEditor: NSViewRepresentable {
+    @Binding var text: String
+    let controller: EditorController
+    /// Takes keyboard focus on creation. Off while the find field wants it.
+    let autoFocus: Bool
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scroll = NSTextView.scrollableTextView()
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        guard let tv = scroll.documentView as? NSTextView else { return scroll }
+
+        tv.delegate = context.coordinator
+        tv.isRichText = false
+        tv.allowsUndo = true
+        tv.isAutomaticQuoteSubstitutionEnabled = false
+        tv.isAutomaticDashSubstitutionEnabled = false
+        tv.isAutomaticTextReplacementEnabled = false
+        tv.isAutomaticSpellingCorrectionEnabled = false
+        tv.isAutomaticLinkDetectionEnabled = false
+        tv.drawsBackground = false
+        tv.textContainerInset = NSSize(width: 8, height: 10)
+        tv.string = text
+        Self.applyStyle(tv)
+
+        controller.textView = tv
+        if autoFocus {
+            DispatchQueue.main.async { tv.window?.makeFirstResponder(tv) }
+        }
+        return scroll
+    }
+
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        guard let tv = scroll.documentView as? NSTextView else { return }
+        context.coordinator.text = $text
+        controller.textView = tv
+        guard tv.string != text else { return }
+        let caret = tv.selectedRange().location
+        tv.string = text
+        Self.applyStyle(tv)
+        let length = (text as NSString).length
+        tv.setSelectedRange(NSRange(location: min(caret, length), length: 0))
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
+
+    /// Assigning `string` drops attributes, so font, colour and line spacing
+    /// are re-applied over the whole run every time the text is replaced.
+    /// `labelColor` is dynamic, so it still follows the window's appearance.
+    private static func applyStyle(_ tv: NSTextView) {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 2
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular),
+            .foregroundColor: NSColor.labelColor,
+            .paragraphStyle: paragraph,
+        ]
+        tv.defaultParagraphStyle = paragraph
+        tv.typingAttributes = attrs
+        tv.insertionPointColor = .labelColor
+        if let storage = tv.textStorage, storage.length > 0 {
+            storage.setAttributes(attrs, range: NSRange(location: 0, length: storage.length))
+        }
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var text: Binding<String>
+
+        init(text: Binding<String>) { self.text = text }
+
+        func textDidChange(_ notification: Notification) {
+            guard let tv = notification.object as? NSTextView else { return }
+            if text.wrappedValue != tv.string { text.wrappedValue = tv.string }
+        }
+    }
+}
+
 // MARK: - WebView
 
 struct MarkdownWebView: NSViewRepresentable {
@@ -605,18 +924,115 @@ struct MarkdownWebView: NSViewRepresentable {
         })();
         """, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         config.userContentController.addUserScript(tracker)
+        // In-page find: wraps every case-insensitive match in <mark>, keeps the
+        // list so the toolbar can step through it, and unwraps on clear.
+        let finder = WKUserScript(source: """
+        (function() {
+          var style = document.createElement('style');
+          style.textContent =
+            'mark.__fm{background:rgba(255,214,10,.42);color:inherit;border-radius:2px;}' +
+            'mark.__fm.__fm-cur{background:#ff9f0a;color:#1a1a1a;}';
+          (document.head || document.documentElement).appendChild(style);
+
+          var marks = [];
+          var cur = -1;
+
+          function clear() {
+            var existing = document.querySelectorAll('mark.__fm');
+            var parents = [];
+            for (var i = 0; i < existing.length; i++) {
+              var m = existing[i];
+              var p = m.parentNode;
+              if (!p) continue;
+              while (m.firstChild) p.insertBefore(m.firstChild, m);
+              p.removeChild(m);
+              if (parents.indexOf(p) === -1) parents.push(p);
+            }
+            for (var j = 0; j < parents.length; j++) parents[j].normalize();
+            marks = [];
+            cur = -1;
+          }
+
+          function textNodes() {
+            var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+              acceptNode: function(n) {
+                if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+                var name = n.parentNode && n.parentNode.nodeName;
+                if (name === 'SCRIPT' || name === 'STYLE' || name === 'NOSCRIPT') {
+                  return NodeFilter.FILTER_REJECT;
+                }
+                return NodeFilter.FILTER_ACCEPT;
+              }
+            });
+            var out = [], n;
+            while ((n = walker.nextNode())) out.push(n);
+            return out;
+          }
+
+          function update(query) {
+            clear();
+            if (!query) return 0;
+            var needle = query.toLowerCase();
+            var nodes = textNodes();
+            for (var i = 0; i < nodes.length; i++) {
+              var node = nodes[i];
+              var lower = node.nodeValue.toLowerCase();
+              var at = 0, hits = [];
+              while ((at = lower.indexOf(needle, at)) !== -1) {
+                hits.push(at);
+                at += needle.length;
+              }
+              // Split from the end so the earlier offsets stay valid.
+              for (var h = hits.length - 1; h >= 0; h--) {
+                var match = node.splitText(hits[h]);
+                match.splitText(needle.length);
+                var mark = document.createElement('mark');
+                mark.className = '__fm';
+                match.parentNode.replaceChild(mark, match);
+                mark.appendChild(match);
+              }
+            }
+            marks = Array.prototype.slice.call(document.querySelectorAll('mark.__fm'));
+            return marks.length;
+          }
+
+          function go(delta) {
+            if (!marks.length) return -1;
+            if (cur >= 0 && marks[cur]) marks[cur].classList.remove('__fm-cur');
+            if (cur < 0) {
+              cur = delta >= 0 ? 0 : marks.length - 1;
+            } else {
+              cur = (cur + delta + marks.length) % marks.length;
+            }
+            var el = marks[cur];
+            el.classList.add('__fm-cur');
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            return cur;
+          }
+
+          function search(query) {
+            var count = update(query);
+            return [count, count > 0 ? go(1) : -1];
+          }
+
+          window.__find = { search: search, go: go, clear: clear };
+        })();
+        """, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+        config.userContentController.addUserScript(finder)
         config.userContentController.add(context.coordinator, name: "scrollPos")
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.setValue(false, forKey: "drawsBackground")
         webView.appearance = theme.nsAppearance
         context.coordinator.webView = webView
+        context.coordinator.controller = controller
         controller.webView = webView
         return webView
     }
 
     func updateNSView(_ webView: WKWebView, context: Context) {
         let coord = context.coordinator
+        coord.controller = controller
         if coord.lastTheme != theme {
             coord.lastTheme = theme
             webView.appearance = theme.nsAppearance
@@ -643,6 +1059,7 @@ struct MarkdownWebView: NSViewRepresentable {
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         weak var webView: WKWebView?
+        var controller: WebController?
         var lastText: String?
         var lastFileURL: URL?
         var lastTheme: AppTheme?
@@ -659,6 +1076,8 @@ struct MarkdownWebView: NSViewRepresentable {
             }
             restoreY = nil
             flushScrollIfReady()
+            // A re-render throws the old highlights away with the old DOM.
+            controller?.reapplyFind()
         }
 
         func userContentController(_ controller: WKUserContentController,
